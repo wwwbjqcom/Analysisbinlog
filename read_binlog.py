@@ -83,6 +83,38 @@ class binlog_events:
     PREVIOUS_GTIDS_LOG_EVENT= 35
 ''''''
 
+'''json type'''
+class json_type:
+    NULL_COLUMN = 251
+    UNSIGNED_CHAR_COLUMN = 251
+    UNSIGNED_SHORT_COLUMN = 252
+    UNSIGNED_INT24_COLUMN = 253
+    UNSIGNED_INT64_COLUMN = 254
+    UNSIGNED_CHAR_LENGTH = 1
+    UNSIGNED_SHORT_LENGTH = 2
+    UNSIGNED_INT24_LENGTH = 3
+    UNSIGNED_INT64_LENGTH = 8
+
+    JSONB_TYPE_SMALL_OBJECT = 0x0
+    JSONB_TYPE_LARGE_OBJECT = 0x1
+    JSONB_TYPE_SMALL_ARRAY = 0x2
+    JSONB_TYPE_LARGE_ARRAY = 0x3
+    JSONB_TYPE_LITERAL = 0x4
+    JSONB_TYPE_INT16 = 0x5
+    JSONB_TYPE_UINT16 = 0x6
+    JSONB_TYPE_INT32 = 0x7
+    JSONB_TYPE_UINT32 = 0x8
+    JSONB_TYPE_INT64 = 0x9
+    JSONB_TYPE_UINT64 = 0xA
+    JSONB_TYPE_DOUBLE = 0xB
+    JSONB_TYPE_STRING = 0xC
+    JSONB_TYPE_OPAQUE = 0xF
+
+    JSONB_LITERAL_NULL = 0x0
+    JSONB_LITERAL_TRUE = 0x1
+    JSONB_LITERAL_FALSE = 0x2
+''''''
+
 BINLOG_FILE_HEADER = b'\xFE\x62\x69\x6E'
 binlog_event_header_len = 19
 binlog_event_fix_part = 13
@@ -168,6 +200,25 @@ class Read(Echo):
         if res >= 0x800000:
             res -= 0x1000000
         return res
+
+    def read_uint_by_size(self, size):
+        '''Read a little endian integer values based on byte number'''
+        if size == 1:
+            return self.read_uint8()
+        elif size == 2:
+            return self.read_uint16()
+        elif size == 3:
+            return self.read_uint24()
+        elif size == 4:
+            return self.read_uint32()
+        elif size == 5:
+            return self.read_uint40()
+        elif size == 6:
+            return self.read_uint48()
+        elif size == 7:
+            return self.read_uint56()
+        elif size == 8:
+            return self.read_uint64()
 
     def read_uint24(self):
         a, b, c = struct.unpack("<BBB", self.read_bytes(3))
@@ -424,6 +475,146 @@ class Read(Echo):
             bit = ord(bit)
         return bit & (1 << (position % 8))
 
+    '''parsing for json'''
+    '''################################################################'''
+    def read_binary_json(self, length):
+        t = self.read_uint8()
+        return self.read_binary_json_type(t, length)
+
+    def read_binary_json_type(self, t, length):
+        large = (t in (json_type.JSONB_TYPE_LARGE_OBJECT, json_type.JSONB_TYPE_LARGE_ARRAY))
+        if t in (json_type.JSONB_TYPE_SMALL_OBJECT, json_type.JSONB_TYPE_LARGE_OBJECT):
+            return self.read_binary_json_object(length - 1, large)
+        elif t in (json_type.JSONB_TYPE_SMALL_ARRAY, json_type.JSONB_TYPE_LARGE_ARRAY):
+            return self.read_binary_json_array(length - 1, large)
+        elif t in (json_type.JSONB_TYPE_STRING,):
+            return self.read_length_coded_pascal_string(1)
+        elif t in (json_type.JSONB_TYPE_LITERAL,):
+            value = self.read_uint8()
+            if value == json_type.JSONB_LITERAL_NULL:
+                return None
+            elif value == json_type.JSONB_LITERAL_TRUE:
+                return True
+            elif value == json_type.JSONB_LITERAL_FALSE:
+                return False
+        elif t == json_type.JSONB_TYPE_INT16:
+            return self.read_int16()
+        elif t == json_type.JSONB_TYPE_UINT16:
+            return self.read_uint16()
+        elif t in (json_type.JSONB_TYPE_DOUBLE,):
+            return struct.unpack('<d', self.read(8))[0]
+        elif t == json_type.JSONB_TYPE_INT32:
+            return self.read_int32()
+        elif t == json_type.JSONB_TYPE_UINT32:
+            return self.read_uint32()
+        elif t == json_type.JSONB_TYPE_INT64:
+            return self.read_int64()
+        elif t == json_type.JSONB_TYPE_UINT64:
+            return self.read_uint64()
+
+        raise ValueError('Json type %d is not handled' % t)
+
+    def read_binary_json_type_inlined(self, t):
+        if t == json_type.JSONB_TYPE_LITERAL:
+            value = self.read_uint16()
+            if value == json_type.JSONB_LITERAL_NULL:
+                return None
+            elif value == json_type.JSONB_LITERAL_TRUE:
+                return True
+            elif value == json_type.JSONB_LITERAL_FALSE:
+                return False
+        elif t == json_type.JSONB_TYPE_INT16:
+            return self.read_int16()
+        elif t == json_type.JSONB_TYPE_UINT16:
+            return self.read_uint16()
+        elif t == json_type.JSONB_TYPE_INT32:
+            return self.read_int32()
+        elif t == json_type.JSONB_TYPE_UINT32:
+            return self.read_uint32()
+
+        raise ValueError('Json type %d is not handled' % t)
+
+    def read_binary_json_object(self, length, large):
+        if large:
+            elements = self.read_uint32()
+            size = self.read_uint32()
+        else:
+            elements = self.read_uint16()
+            size = self.read_uint16()
+
+        if size > length:
+            raise ValueError('Json length is larger than packet length')
+
+        if large:
+            key_offset_lengths = [(
+                self.read_uint32(),  # offset (we don't actually need that)
+                self.read_uint16()   # size of the key
+                ) for _ in range(elements)]
+        else:
+            key_offset_lengths = [(
+                self.read_uint16(),  # offset (we don't actually need that)
+                self.read_uint16()   # size of key
+                ) for _ in range(elements)]
+
+        value_type_inlined_lengths = [self.read_offset_or_inline(large)
+                                      for _ in range(elements)]
+
+        keys = [self.__read_decode(x[1]) for x in key_offset_lengths]
+
+        out = {}
+        for i in range(elements):
+            if value_type_inlined_lengths[i][1] is None:
+                data = value_type_inlined_lengths[i][2]
+            else:
+                t = value_type_inlined_lengths[i][0]
+                data = self.read_binary_json_type(t, length)
+            out[keys[i]] = data
+
+        return out
+
+    def read_binary_json_array(self, length, large):
+        if large:
+            elements = self.read_uint32()
+            size = self.read_uint32()
+        else:
+            elements = self.read_uint16()
+            size = self.read_uint16()
+
+        if size > length:
+            raise ValueError('Json length is larger than packet length')
+
+        values_type_offset_inline = [
+            self.read_offset_or_inline(self, large)
+            for _ in range(elements)]
+
+        def _read(x):
+            if x[1] is None:
+                return x[2]
+            return self.read_binary_json_type(x[0], length)
+
+        return [_read(x) for x in values_type_offset_inline]
+
+    def read_offset_or_inline(self,large):
+        t = self.read_uint8()
+
+        if t in (json_type.JSONB_TYPE_LITERAL,
+                 json_type.JSONB_TYPE_INT16, json_type.JSONB_TYPE_UINT16):
+            return (t, None, self.read_binary_json_type_inlined(t))
+        if large and t in (json_type.JSONB_TYPE_INT32, json_type.JSONB_TYPE_UINT32):
+            return (t, None, self.read_binary_json_type_inlined(t))
+
+        if large:
+            return (t, self.read_uint32(), None)
+        return (t, self.read_uint16(), None)
+
+    def read_length_coded_pascal_string(self, size):
+        """Read a string with length coded using pascal style.
+        The string start by the size of the string
+        """
+        length = self.read_uint_by_size(size)
+        return self.__read_decode(length)
+    '''###################################################'''
+
     def read_header(self):
         '''binlog_event_header_len = 19
         timestamp : 4bytes
@@ -504,7 +695,8 @@ class Read(Echo):
                 metadata = self.read_uint16()
                 metadata_dict[idex] = 2 if metadata > 255 else 1
                 bytes += 2
-            elif colums_type_id_list[idex] in [column_type_dict.MYSQL_TYPE_BLOB,column_type_dict.MYSQL_TYPE_MEDIUM_BLOB,column_type_dict.MYSQL_TYPE_LONG_BLOB,column_type_dict.MYSQL_TYPE_TINY_BLOB]:
+            elif colums_type_id_list[idex] in [column_type_dict.MYSQL_TYPE_BLOB,column_type_dict.MYSQL_TYPE_MEDIUM_BLOB,column_type_dict.MYSQL_TYPE_LONG_BLOB,
+                                               column_type_dict.MYSQL_TYPE_TINY_BLOB,column_type_dict.MYSQL_TYPE_JSON]:
                 metadata = self.read_uint8()
                 metadata_dict[idex] = metadata
                 bytes += 1
@@ -521,6 +713,10 @@ class Read(Echo):
                 metadata = self.read_uint8()
                 metadata_dict[idex] = metadata
                 bytes += 1
+            elif colums_type_id_list[idex] in [column_type_dict.MYSQL_TYPE_STRING]:
+                _type,metadata, = struct.unpack('=BB',self.read_bytes(2))
+                metadata_dict[idex] = metadata
+                bytes += 2
 
 
         self.read_bytes(event_length - binlog_event_header_len - table_map_event_fix_length - 5 - database_name_length
@@ -631,6 +827,8 @@ class Read(Echo):
                 elif colums_type_id_list[idex] in [column_type_dict.MYSQL_TYPE_VARCHAR ,column_type_dict.MYSQL_TYPE_VAR_STRING ,column_type_dict.MYSQL_TYPE_BLOB,
                                                    column_type_dict.MYSQL_TYPE_TINY_BLOB,column_type_dict.MYSQL_TYPE_LONG_BLOB,column_type_dict.MYSQL_TYPE_MEDIUM_BLOB]:
                     _metadata = metadata_dict[idex]
+                    value_length = self.read_uint_by_size(_metadata)
+                    '''
                     if _metadata == 1:
                         value_length = self.read_uint8()
                     elif _metadata == 2:
@@ -639,12 +837,25 @@ class Read(Echo):
                         value_length = self.read_uint24()
                     elif _metadata == 4:
                         value_length = self.read_uint32()
+                    '''
                     values.append(self.__read_decode(value_length))
                     bytes += value_length + _metadata
+                elif colums_type_id_list[idex] in [column_type_dict.MYSQL_TYPE_JSON]:
+                    _metadata = metadata_dict[idex]
+                    value_length = self.read_uint_by_size(_metadata)
+                    values.append(self.read_binary_json(value_length))
+                    bytes += value_length + _metadata
                 elif colums_type_id_list[idex] == column_type_dict.MYSQL_TYPE_STRING:
-                    value_length = self.read_uint8()
-                    values.append(self.__read_decode(value_length))
-                    bytes += value_length + 1
+                    _metadata = metadata_dict[idex]
+                    if _metadata <= 255:
+                        value_length = self.read_uint8()
+                        values.append(self.__read_decode(value_length))
+                        _read = 1
+                    else:
+                        value_length = self.read_uint16()
+                        values.append(self.__read_decode(value_length))
+                        _read = 2
+                    bytes += value_length + _read
 
 
                 nullBitmapIndex += 1
