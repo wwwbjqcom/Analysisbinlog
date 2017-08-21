@@ -224,6 +224,10 @@ class Read(Echo):
         a, b, c = struct.unpack("<BBB", self.read_bytes(3))
         return a + (b << 8) + (c << 16)
 
+    def read_int24(self):
+        a, b, c = struct.unpack("<bbb", self.read_bytes(3))
+        return a + (b << 8) + (c << 16)
+
     def read_uint40(self):
         a, b = struct.unpack("<BI", self.read_bytes(5))
         return a + (b << 8)
@@ -670,7 +674,7 @@ class Read(Echo):
             colums_type_array : one byte per column  
             mmetadata_lenth : 1bytes
             metadata : .....(only available in the variable length field，varchar:2bytes，text、blob:1bytes,time、timestamp、datetime: 1bytes
-                            blob、float、decimal : 1bytes)
+                            blob、float、decimal : 1bytes, char、enum、binary、set: 2bytes(column type id :1bytes metadatea: 1bytes))
             bit_filed : 1bytes
             crc : 4bytes
             .........
@@ -686,7 +690,7 @@ class Read(Echo):
         a = '='
         for i in range(colums):
             a += 'B'
-        colums_type_id_list = struct.unpack(a,self.read_bytes(colums))
+        colums_type_id_list = list(struct.unpack(a,self.read_bytes(colums)))
         self.read_bytes(1)
         metadata_dict = {}
         bytes = 1
@@ -715,6 +719,7 @@ class Read(Echo):
                 bytes += 1
             elif colums_type_id_list[idex] in [column_type_dict.MYSQL_TYPE_STRING]:
                 _type,metadata, = struct.unpack('=BB',self.read_bytes(2))
+                colums_type_id_list[idex] = _type
                 metadata_dict[idex] = metadata
                 bytes += 2
 
@@ -774,6 +779,12 @@ class Read(Echo):
                     except:
                         values.append(self.read_int16())
                     bytes += 2
+                elif colums_type_id_list[idex] == column_type_dict.MYSQL_TYPE_INT24:
+                    try:
+                        values.append(self.read_uint24())
+                    except:
+                        values.append(self.read_int24())
+                    bytes += 3
                 elif colums_type_id_list[idex] == column_type_dict.MYSQL_TYPE_LONG:
                     try:
                         values.append(self.read_uint32())
@@ -856,6 +867,13 @@ class Read(Echo):
                         values.append(self.__read_decode(value_length))
                         _read = 2
                     bytes += value_length + _read
+                elif colums_type_id_list[idex] == column_type_dict.MYSQL_TYPE_ENUM:
+                    _metadata = metadata_dict[idex]
+                    if _metadata == 1:
+                        values.append('@'+str(self.read_uint8()))
+                    elif _metadata == 2:
+                        values.append('@'+str(self.read_uint16()))
+                    bytes += _metadata
 
 
                 nullBitmapIndex += 1
