@@ -587,9 +587,7 @@ class Read(Echo):
         if size > length:
             raise ValueError('Json length is larger than packet length')
 
-        values_type_offset_inline = [
-            self.read_offset_or_inline(self, large)
-            for _ in range(elements)]
+        values_type_offset_inline = [self.read_offset_or_inline(large) for _ in range(elements)]
 
         def _read(x):
             if x[1] is None:
@@ -748,7 +746,23 @@ class Read(Echo):
         return struct.unpack('%ds' % count,_value)[0]
 
     def read_row_event(self,event_length,colums_type_id_list,metadata_dict,type):
-        '''The length of the varchar type more than 255 are 2 bytes'''
+        '''
+        fixed_part: 10bytes
+            table_id: 6bytes
+            reserved: 2bytes
+            extra: 2bytes
+        variable_part:
+            columns: 1bytes
+            variable_sized: int((n+7)/8) n=columns.value
+            variable_sized: int((n+7)/8) (for updata_row_event only)
+            
+            variable_sized: int((n+7)/8)
+            row_value : variable size
+            
+            crc : 4bytes
+            
+        The The data first length of the varchar type more than 255 are 2 bytes
+        '''
         self.read_bytes(fix_length+binlog_row_event_extra_headers)
         columns = self.read_uint8()
         columns_length = (columns+7)/8
@@ -761,11 +775,10 @@ class Read(Echo):
         __values = []
         while event_length - bytes > binlog_quer_event_stern:
             values = []
-            nullBitmapIndex = 0
             null_bit = self.read_bytes(columns_length)
             bytes += columns_length
             for idex in range(len(colums_type_id_list)):
-                if self.__is_null(null_bit, nullBitmapIndex):
+                if self.__is_null(null_bit, idex):
                     values.append('Null')
                 elif colums_type_id_list[idex] == column_type_dict.MYSQL_TYPE_TINY:
                     try:
@@ -875,8 +888,6 @@ class Read(Echo):
                         values.append('@'+str(self.read_uint16()))
                     bytes += _metadata
 
-
-                nullBitmapIndex += 1
             if type == 'UPDATE_ROWS_EVENT':
                 __values.append(values)
             else:
