@@ -4,9 +4,10 @@
 @author: xiaozhong
 '''
 
-import struct,time,datetime
-import sys,decimal,getopt
-
+import struct,time,datetime,os
+import sys,decimal,getopt,types
+reload(sys)
+sys.setdefaultencoding('utf-8')
 '''column type '''
 class column_type_dict:
     MYSQL_TYPE_DECIMAL=0
@@ -127,6 +128,18 @@ fix_length = 8
 
 
 
+''''''
+class _rollback:
+    rollback_status = None
+
+    database = None
+    table = None
+    _gtid = None
+
+    _myfile = None
+    _myfunc = None
+''''''
+
 
 class Echo(object):
     '''
@@ -134,26 +147,185 @@ class Echo(object):
     '''
 
     def Version(self, binlog_ver, server_ver, create_time):
-        print 'binlog_ver : %s   server_ver : %s   create_time : %d' % (binlog_ver, server_ver, create_time)
+        print 'binlog_ver : {}   server_ver : {}   create_time : {}'.format(binlog_ver, server_ver, create_time)
+
 
     def TractionHeader(self, thread_id, database_name, sql_statement, timestamp,_pos):
-        print '%s%2sthread id : %d  at pos : %d  database : %s   statement : %s' % (timestamp, '', thread_id, _pos,database_name, sql_statement)
-
+        if _rollback.rollback_status:
+            _rollback.database = database_name
+        else:
+            print '{}  thread id : {}  at pos : {}  database : {}   statement : {}'.format(timestamp, thread_id, _pos, database_name, sql_statement)
     def Xid(self, timestamp, xid_num,_pos):
-        print '%s%2sstatement : COMMIT  xid : %s  at pos : %d' % (timestamp, '', xid_num,_pos)
-        print ''
+        if _rollback.rollback_status is None:
+            print '{}  statement : COMMIT  xid : {}  at pos : {}'.format(timestamp, xid_num,_pos)
+            print ''
+        else:
+            _rollback._myfunc.SaveGtid(xid=True)
 
     def Tablemap(self, timestamp, tablename):
-        print '%s%2stablename : %s' % (timestamp, '', tablename)
-
+        if _rollback.rollback_status:
+            _rollback.table = tablename
+        else:
+            print '{}  tablename : {}'.format(timestamp, tablename)
     def Gtid(self, timestamp, gtid,_pos):
-        print '%s%2sGTID_NEXT : %s at pos : %d' % (timestamp, '', gtid,_pos)
+        if _rollback.rollback_status:
+            _rollback._myfunc.SaveGtid(gtid=gtid)
+        else:
+            print '{}  GTID_NEXT : {} at pos : {}'.format(timestamp, gtid,_pos)
 
     def TractionVlues(self, before_value=None, after_value=None, type=None):
-        if before_value:
-            print '%21s%s  before_value : %s  after_value : %s' % ('', type, before_value, after_value)
+        if _rollback.rollback_status:
+            _rollback._myfunc.CreateSQL(before_value=before_value,after_value=after_value,event_type=type)
         else:
-            print '%21s%s  value : %s ' % ('', type, after_value)
+            if type == binlog_events.UPDATE_ROWS_EVENT:
+                print '{: >21}{}  before_value : [{}]  after_value : [{}]'.format('', 'UPDATE_ROWS_EVENT',
+                                        ','.join(['{}'.format(a) for a in before_value]), ','.join(['{}'.format(a) for a in after_value]))
+            else:
+                if type == binlog_events.DELETE_ROWS_EVENT:
+                    print '{: >21}{}  value : [{}] '.format('', 'DELETE_ROW_EVENT', ','.join(['{}'.format(a) for a in  after_value]))
+                elif type == binlog_events.WRITE_ROWS_EVENT:
+                    print '{: >21}{}  value : [{}] '.format('', 'WRITE_ROW_EVENT', ','.join(['{}'.format(a) for a in  after_value]))
+
+class PrintSql(object):
+    def __seek(self,num):
+        try:
+            _rollback._myfile.seek(-num,1)
+        except:
+            _rollback._myfile.close()
+            self.rmfile()
+            sys.exit()
+    def read(self):
+        _num = 9
+        _rollback._myfile.seek(0,2)
+        while True:
+            self.__seek(_num)
+            _value,_type_code, = struct.unpack('QB',_rollback._myfile.read(_num))
+            self.__seek(_num)
+            if _type_code == 1:
+                self.__gtid(_value)
+            elif _type_code == 2:
+                self.__statement(_value)
+            else:
+                print 'Error: type_code {} '.format(_type_code)
+    def __gtid(self,tid):
+        self.__seek(36)
+        _uuid = _rollback._myfile.read(36)
+        gtid = _uuid.decode('utf8') + ':' + str(tid)
+        print ''
+        print '#{: >10}  GTID_NEXT : {}'.format('-',gtid)
+        self.__seek(36)
+    def __statement(self,length):
+        self.__seek(length)
+        _sql = _rollback._myfile.read(length)
+        sql, = struct.unpack('{}s'.format(length),_sql)
+        print '{: >10}{}'.format('',sql)
+        self.__seek(length)
+
+    def rmfile(self):
+        os.remove('tmp_rollback')
+
+class GetRollStatement(object):
+    def __init__(self,host,user,passwd,port):
+        import MySQLdb,traceback
+        try:
+            self.local_conn = MySQLdb.connect(host=host, user=user, passwd=passwd, port=port, db='',
+                                         charset="utf8")
+            self.mysql_cur = self.local_conn.cursor()
+        except MySQLdb.Error,e:
+            print traceback.format_exc()
+        self.column_list = []
+        self._is_pri = []
+    def __join(self,column,value):
+        if type(value) is types.IntType or type(value) is types.LongType:
+            return ' {}={}'.format(column, value)
+        elif type(value) is types.FloatType:
+            return ' {}={}'.format(column, value)
+        else:
+            return  ' {}={}'.format(column,value)
+    def WriteEvent(self,values):
+        sql = 'delete from {}.{} where '.format(_rollback.database,_rollback.table)
+        if self._is_pri:
+            sql += self.__join(self._is_pri[0][0],values[self._is_pri[0][1]])
+        else:
+            for i,column in enumerate(self.column_list):
+                sql += self.__join(column[0],values[i])
+                if column != self.column_list[-1]:
+                    sql += ' and'
+        self.__tmppack(sql,2)
+    def DeleteEvent(self,values):
+        sql = 'insert into {}.{}({}) values('.format(_rollback.database,_rollback.table,','.join([a[0] for a in self.column_list]))
+        for value in values:
+            if type(value) is types.IntType:
+                sql += '{}'.format(value)
+            elif type(value) is types.FloatType:
+                sql += '{}'.format(value)
+            else:
+                sql += '"{}"'.format(value)
+            if value == values[-1]:
+                sql += ')'
+            else:
+                sql += ','
+        self.__tmppack(sql, 2)
+    def UpateEvent(self,after_values,befor_values):
+        _set = []
+        _where = []
+        if self._is_pri:
+            _where.append(self.__join(self._is_pri[0][0],after_values[self._is_pri[0][1]]))
+        else:
+            for i,column in enumerate(self.column_list):
+                _where.append(self.__join(column[0],after_values[i]))
+
+        for i,column in enumerate(self.column_list):
+            _set.append(self.__join(column[0],befor_values[i]))
+        sql = 'update {}.{} set {} where {}'.format(_rollback.database, _rollback.table, ','.join(_set).replace(" ",""), ','.join(_where))
+        self.__tmppack(sql, 2)
+
+    def GetColumnName(self):
+        sql = 'desc {}.{};'.format(_rollback.database,_rollback.table)
+        self.mysql_cur.execute(sql)
+        result = self.mysql_cur.fetchall()
+        self.column_list = [[a[0],a[3]] for a in result]
+
+    def CreateSQL(self,before_value=None,after_value=None,event_type=None):
+        self.GetColumnName()
+        self._is_pri = [[_a[0], idex] for idex, _a in enumerate(self.column_list) if 'PRI' in _a]
+        if event_type == binlog_events.WRITE_ROWS_EVENT:
+            self.WriteEvent(after_value)
+        elif event_type == binlog_events.UPDATE_ROWS_EVENT:
+            self.UpateEvent(after_value,before_value)
+        elif event_type == binlog_events.DELETE_ROWS_EVENT:
+            self.DeleteEvent(after_value)
+
+    def SaveGtid(self,gtid=None,xid=None):
+        if xid:
+            __gtid = _rollback._gtid.split(':')
+            tid = int(__gtid[1])
+            uuid = str(__gtid[0])
+            self.__tmppackgtid(uuid,tid,1)
+        elif _rollback._gtid != gtid:
+            _rollback._gtid = gtid
+
+    def __tmppackgtid(self,uuid,tid,type):
+        s_uuid = struct.Struct('{}s'.format(len(uuid)))
+        s_header = struct.Struct('QB')
+        _uuid = s_uuid.pack(uuid)
+        _header = s_header.pack(tid,type)
+        _rollback._myfile.write(_uuid)
+        _rollback._myfile.write(_header)
+    def __tmppack(self,value,type):
+        import re
+        _value = re.sub(r"\s{2,}"," ",str(value).strip()) + ';'
+        s_value = struct.Struct('{}s'.format(len(_value)))
+        s_header = struct.Struct('QB')
+        _value = s_value.pack(_value)
+        _header = s_header.pack(len(_value),type)
+        _rollback._myfile.write(_value)
+        _rollback._myfile.write(_header)
+
+    def _close(self):
+        self.mysql_cur.close()
+        self.local_conn.close()
+
 
 class Read(Echo):
     def __init__(self,start_position=None,filename=None):
@@ -163,7 +335,7 @@ class Read(Echo):
             print 'error : Is not a standard binlog file format'
             exit()
         if start_position:
-            self.read_bytes(start_position-4)
+            self.file_data.seek(start_position-4,1)
 
     def read_int_be_by_size(self, size ,bytes=None):
         '''Read a big endian integer values based on byte number'''
@@ -649,13 +821,13 @@ class Read(Echo):
         read_byte = self.read_bytes(binlog_event_fix_part)
         fix_result = struct.unpack('=IIBHH',read_byte)
         thread_id = fix_result[0]
-        self.read_bytes(fix_result[4])
+        self.file_data.seek(fix_result[4],1)
         read_byte = self.read_bytes(fix_result[2])
-        database_name, = struct.unpack('%ds' % fix_result[2],read_byte)
+        database_name, = struct.unpack('{}s'.format(fix_result[2]),read_byte)
         statement_length = event_length - binlog_event_fix_part - binlog_event_header_len \
                            - fix_result[4] - fix_result[2] - binlog_quer_event_stern
         read_byte = self.read_bytes(statement_length)
-        _a,sql_statement, = struct.unpack('1s%ds' % (statement_length-1),read_byte)
+        _a,sql_statement, = struct.unpack('1s{}s'.format(statement_length-1),read_byte)
         return thread_id,database_name,sql_statement
 
     def read_table_map_event(self,event_length):
@@ -679,17 +851,17 @@ class Read(Echo):
         :param event_length: 
         :return: 
         '''
-        self.read_bytes(table_map_event_fix_length)
+        self.file_data.seek(table_map_event_fix_length,1)
         database_name_length, = struct.unpack('B',self.read_bytes(1))
-        database_name,_a, = struct.unpack('%dss' % (database_name_length),self.read_bytes(database_name_length+1))
+        database_name,_a, = struct.unpack('{}ss'.format(database_name_length),self.read_bytes(database_name_length+1))
         table_name_length, = struct.unpack('B',self.read_bytes(1))
-        table_name,_a, = struct.unpack('%dss' % table_name_length,self.read_bytes(table_name_length+1))
+        table_name,_a, = struct.unpack('{}ss'.format(table_name_length),self.read_bytes(table_name_length+1))
         colums = self.read_uint8()
         a = '='
         for i in range(colums):
             a += 'B'
         colums_type_id_list = list(struct.unpack(a,self.read_bytes(colums)))
-        self.read_bytes(1)
+        self.file_data.seek(1,1)
         metadata_dict = {}
         bytes = 1
         for idex in range(len(colums_type_id_list)):
@@ -722,18 +894,18 @@ class Read(Echo):
                 bytes += 2
 
 
-        self.read_bytes(event_length - binlog_event_header_len - table_map_event_fix_length - 5 - database_name_length
-                        - table_name_length - colums  - bytes)
+        self.file_data.seek(event_length - binlog_event_header_len - table_map_event_fix_length - 5 - database_name_length
+                       - table_name_length - colums  - bytes,1)
         return database_name,table_name,colums_type_id_list,metadata_dict
 
     def read_gtid_event(self,event_length):
-        self.read_bytes(1)
+        self.file_data.seek(1,1)
         uuid = self.read_bytes(16)
         gtid = "%s%s%s%s-%s%s-%s%s-%s%s-%s%s%s%s%s%s" %\
                tuple("{0:02x}".format(ord(c)) for c in uuid)
-        gno_id = struct.unpack('Q',self.read_bytes(8))
-        gtid += ":%d" % gno_id
-        self.read_bytes(event_length - 1 - 16 - 8 - binlog_event_header_len)
+        gno_id = self.read_uint64()
+        gtid += ":{}".format(gno_id)
+        self.file_data.seek(event_length - 1 - 16 - 8 - binlog_event_header_len,1)
         return gtid
 
     def read_xid_variable(self):
@@ -743,7 +915,7 @@ class Read(Echo):
 
     def __read_decode(self,count):
         _value = self.read_bytes(count)
-        return struct.unpack('%ds' % count,_value)[0]
+        return struct.unpack('{}s'.format(count),_value)[0]
 
     def read_row_event(self,event_length,colums_type_id_list,metadata_dict,type):
         '''
@@ -763,12 +935,12 @@ class Read(Echo):
             
         The The data first length of the varchar type more than 255 are 2 bytes
         '''
-        self.read_bytes(fix_length+binlog_row_event_extra_headers)
+        self.file_data.seek(fix_length+binlog_row_event_extra_headers,1)
         columns = self.read_uint8()
         columns_length = (columns+7)/8
-        self.read_bytes(columns_length)
-        if type == 'UPDATE_ROWS_EVENT':
-            self.read_bytes(columns_length)
+        self.file_data.seek(columns_length,1)
+        if type == binlog_events.UPDATE_ROWS_EVENT:
+            self.file_data.seek(columns_length,1)
             bytes = binlog_event_header_len + fix_length + binlog_row_event_extra_headers + 1 + columns_length + columns_length
         else:
             bytes = binlog_event_header_len + fix_length + binlog_row_event_extra_headers + 1 + columns_length
@@ -888,11 +1060,11 @@ class Read(Echo):
                         values.append('@'+str(self.read_uint16()))
                     bytes += _metadata
 
-            if type == 'UPDATE_ROWS_EVENT':
+            if type == binlog_events.UPDATE_ROWS_EVENT:
                 __values.append(values)
             else:
                 super(Read,self).TractionVlues(after_value=values,type=type)
-        self.read_bytes(event_length - bytes)
+        self.file_data.seek(event_length - bytes,1)
         return __values
 
 
@@ -913,11 +1085,13 @@ class Read(Echo):
 
 class CheckEvent(Echo):
     def __init__(self,filename=None,start_position=None,stop_position=None,
-                 start_datetime=None,stop_datetime=None,_thread_id=None,gtid=None,rollback=None):
+                 start_datetime=None,stop_datetime=None,_thread_id=None,gtid=None,rollback=None,
+                 user=None,host=None,passwd=None,port=None):
         self.cloums_type_id_list = None
         self.metadata_dict = None
         self._gtid = None
         self._thread_id_status = None
+        self._func = None
 
         self.start_position = start_position
         self.stop_position = stop_position
@@ -925,7 +1099,15 @@ class CheckEvent(Echo):
         self.stop_datetime = stop_datetime
         self._thread_id = _thread_id
         self.gtid = gtid
-        self.rollback = rollback
+        if rollback:
+            if user is None or host is None or passwd is None or port is None:
+                Usage()
+                sys.exit()
+            _rollback.rollback_status = True
+            _rollback._myfunc = GetRollStatement(host=host,user=user,passwd=passwd,port=port)
+            if os.path.exists('tmp_rollback'):
+                os.remove('tmp_rollback')
+            _rollback._myfile = open('tmp_rollback','a+')
 
         self._pos = start_position if start_position else 4
         if filename is None:
@@ -954,10 +1136,10 @@ class CheckEvent(Echo):
                         self._gtid = gtid
                         self.Gtid(execute_time, gtid, self._pos)
                 else:
-                    self.readbinlog.read_bytes(event_length-binlog_event_header_len)
+                    self.readbinlog.file_data.seek(event_length-binlog_event_header_len,1)
             else:
                 if type_code == binlog_events.GTID_LOG_EVENT:
-                    sys.exit()
+                    break
                 self.__read_event(type_code,event_length,execute_time)
             self._pos += event_length
             type_code, event_length, execute_time = self.readbinlog.read_header()
@@ -977,10 +1159,12 @@ class CheckEvent(Echo):
             if type_code == binlog_events.QUERY_EVENT and self._thread_id_status is None:
                 thread_id, database_name, sql_statement = self.readbinlog.read_query_event(event_length)
                 if thread_id == self._thread_id:
+                    if self._gtid:
+                        self.Gtid(execute_time, self._gtid, self._pos)
                     self._thread_id_status = True
                     self.TractionHeader(thread_id, database_name, sql_statement, execute_time, self._pos)
-                self.readbinlog.read_bytes(4)
-            elif self._thread_id_status and type_code != binlog_events.QUERY_EVENT:
+                self.readbinlog.file_data.seek(4,1)
+            elif self._thread_id_status and type_code != binlog_events.QUERY_EVENT and type_code != binlog_events.GTID_LOG_EVENT:
                 self.__read_event(type_code,event_length,execute_time)
             elif type_code == binlog_events.QUERY_EVENT and self._thread_id_status:
                 thread_id, database_name, sql_statement = self.readbinlog.read_query_event(event_length)
@@ -988,9 +1172,11 @@ class CheckEvent(Echo):
                     self._thread_id_status = None
                 else:
                     self.TractionHeader(thread_id, database_name, sql_statement, execute_time, self._pos)
-                self.readbinlog.read_bytes(4)
+                self.readbinlog.file_data.seek(4, 1)
+            elif type_code == binlog_events.GTID_LOG_EVENT and self._thread_id_status is None:
+                self._gtid = self.readbinlog.read_gtid_event(event_length)
             else:
-                self.readbinlog.read_bytes(event_length-binlog_event_header_len)
+                self.readbinlog.file_data.seek(event_length-binlog_event_header_len,1)
             self._pos += event_length
             type_code, event_length, execute_time = self.readbinlog.read_header()
 
@@ -998,15 +1184,15 @@ class CheckEvent(Echo):
         if type_code == binlog_events.FORMAT_DESCRIPTION_EVENT:
             binlog_ver, server_ver, create_time = self.readbinlog.read_format_desc_event()
             self.Version(binlog_ver, server_ver, create_time)
-            self.readbinlog.read_bytes(event_length - binlog_event_header_len - read_format_desc_event_length)
+            self.readbinlog.file_data.seek(event_length - binlog_event_header_len - read_format_desc_event_length,1)
         elif type_code == binlog_events.QUERY_EVENT:
             thread_id, database_name, sql_statement = self.readbinlog.read_query_event(event_length)
             self.TractionHeader(thread_id, database_name, sql_statement, execute_time, self._pos)
-            self.readbinlog.read_bytes(4)
+            self.readbinlog.file_data.seek(4,1)
         elif type_code == binlog_events.XID_EVENT:
             xid_num = self.readbinlog.read_xid_variable()
             self.Xid(execute_time, xid_num, self._pos)
-            self.readbinlog.read_bytes(4)
+            self.readbinlog.file_data.seek(4,1)
         elif type_code == binlog_events.TABLE_MAP_EVENT:
             database_name, table_name, self.cloums_type_id_list, self.metadata_dict = self.readbinlog.read_table_map_event(
                 event_length)
@@ -1015,14 +1201,13 @@ class CheckEvent(Echo):
             gtid = self.readbinlog.read_gtid_event(event_length)
             self.Gtid(execute_time, gtid, self._pos)
         elif type_code == binlog_events.WRITE_ROWS_EVENT:
-            self.readbinlog.write_row_event(event_length, self.cloums_type_id_list, self.metadata_dict, 'WRITE_ROWS_EVENT')
+            self.readbinlog.write_row_event(event_length, self.cloums_type_id_list, self.metadata_dict, type_code)
         elif type_code == binlog_events.DELETE_ROWS_EVENT:
-            self.readbinlog.delete_row_event(event_length, self.cloums_type_id_list, self.metadata_dict, 'DELETE_ROWS_EVENT')
+            self.readbinlog.delete_row_event(event_length, self.cloums_type_id_list, self.metadata_dict, type_code)
         elif type_code == binlog_events.UPDATE_ROWS_EVENT:
-            self.readbinlog.update_row_event(event_length, self.cloums_type_id_list, self.metadata_dict, 'UPDATE_ROWS_EVENT')
+            self.readbinlog.update_row_event(event_length, self.cloums_type_id_list, self.metadata_dict, type_code)
         else:
-            self.readbinlog.read_bytes(event_length - binlog_event_header_len)
-
+            self.readbinlog.file_data.seek(event_length - binlog_event_header_len,1)
 
     def __read_binlog(self,type,type_code=None,event_length=None,execute_time=None):
         if type_code is None and event_length is None and execute_time is None:
@@ -1052,7 +1237,7 @@ class CheckEvent(Echo):
                 type_code, event_length, execute_time = self.readbinlog.read_header()
                 if  execute_time >= self.start_datetime:
                     break
-                self.readbinlog.read_bytes(event_length - binlog_event_header_len)
+                self.readbinlog.file_data.seek(event_length - binlog_event_header_len,1)
                 self._pos += event_length
             if self.gtid:
                 self.__gtid_event_filter('datetime',type_code,event_length,execute_time)
@@ -1067,6 +1252,11 @@ class CheckEvent(Echo):
                 self.__thread_id_filed('pos')
             else:
                 self.__read_binlog('pos')
+        self.readbinlog.file_data.close()
+        if _rollback.rollback_status:
+            _rollback._myfunc._close()
+            ps = PrintSql()
+            ps.read()
 
 
 
@@ -1098,14 +1288,19 @@ def Usage():
             
             -g [--gtid] : obtain a certain GTID content of transactions  
             
-            --rollback : generate the rollback statement
+            --rollback : generate the rollback statement 
+                If you use the rollback, you must specify all of the options below
+                --user : mysql user
+                --passwd : password for mysql user
+                --host : mysql host
+                --port : mysql port
     	    """
     print __usage__
 
 def main(argv):
     _argv = {}
     try:
-        opts, args = getopt.getopt(argv[1:], 'hrf:t:g:', ['help', 'file=', 'start-position=','stop-position=','start-datetime=','stop-datetime=','thread-id=','gtid=','rollback'])
+        opts, args = getopt.getopt(argv[1:], 'hrf:t:g:', ['help', 'file=', 'start-position=','stop-position=','start-datetime=','stop-datetime=','host=','user=','passwd=','port=','thread-id=','gtid=','rollback'])
     except getopt.GetoptError, err:
         print str(err)
         Usage()
@@ -1130,6 +1325,14 @@ def main(argv):
             _argv['gtid'] = a
         elif o in ('-r','--rollback'):
             _argv['rollback'] = True
+        elif o in ('--user'):
+            _argv['user'] = a
+        elif o in ('--host'):
+            _argv['host'] = a
+        elif o in ('--passwd'):
+            _argv['passwd'] = a
+        elif o in ('--port'):
+            _argv['port'] = int(a)
         else:
             print 'unhandled option'
             sys.exit(3)
@@ -1139,12 +1342,17 @@ def main(argv):
             CheckEvent(filename=_argv['file'],gtid=(_argv['gtid'] if 'gtid' in _argv else None),
                        start_position=(_argv['start-position'] if 'start-position' in _argv else None),
                        stop_position=(_argv['stop-position'] if 'stop-position' in _argv else None),
-                       rollback = _argv['rollback'])
+                       rollback = _argv['rollback'],user=_argv['user'],host=_argv['host'],passwd=_argv['passwd'],
+                       port=_argv['port'],_thread_id=(_argv['thread-id'] if 'thread-id' in _argv else None))
         elif 'gtid' in _argv:
             CheckEvent(filename=_argv['file'],
-                       gtid=(_argv['gtid'] if 'gtid' in _argv else None),rollback=_argv['rollback'])
+                       gtid=(_argv['gtid'] if 'gtid' in _argv else None),rollback=_argv['rollback'],
+                       user=_argv['user'],host=_argv['host'],passwd=_argv['passwd'],port=_argv['port'])
         else:
-            CheckEvent(filename=_argv['file'],rollback=_argv['rollback'])
+            CheckEvent(filename=_argv['file'],rollback=_argv['rollback'],user=_argv['user'],host=_argv['host'],
+                       passwd=_argv['passwd'],port=_argv['port'],
+                       _thread_id=(_argv['thread-id'] if 'thread-id' in _argv else None))
+
     elif 'start-position' in _argv:
         CheckEvent(start_position=(_argv['start-position'] if _argv['start-position'] else None),
                         filename=_argv['file'],gtid=(_argv['gtid'] if 'gtid' in _argv else None),
