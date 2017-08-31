@@ -991,7 +991,29 @@ class Read(Echo):
         return database_name,table_name,colums_type_id_list,metadata_dict
 
     def read_gtid_event(self,event_length=None):
-
+        '''
+        The layout of the buffer is as follows:
+        +------+--------+-------+-------+--------------+---------------+
+        |flags |SID     |GNO    |lt_type|last_committed|sequence_number|
+        |1 byte|16 bytes|8 bytes|1 byte |8 bytes       |8 bytes        |
+        +------+--------+-------+-------+--------------+---------------+
+    
+        The 'flags' field contains gtid flags.
+            0 : rbr_only ,"/*!50718 SET TRANSACTION ISOLATION LEVEL READ COMMITTED*/%s\n"
+            1 : sbr
+    
+        lt_type (for logical timestamp typecode) is always equal to the
+        constant LOGICAL_TIMESTAMP_TYPECODE.
+    
+        5.6 did not have TS_TYPE and the following fields. 5.7.4 and
+        earlier had a different value for TS_TYPE and a shorter length for
+        the following fields. Both these cases are accepted and ignored.
+    
+        The buffer is advanced in Binary_log_event constructor to point to
+        beginning of post-header
+        :param event_length: 
+        :return: 
+        '''
         self.read_bytes(1)
         uuid = self.read_bytes(16)
         gtid = "%s%s%s%s-%s%s-%s%s-%s%s-%s%s%s%s%s%s" %\
