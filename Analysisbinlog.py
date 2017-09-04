@@ -127,6 +127,10 @@ table_map_event_fix_length = 8
 fix_length = 8
 
 
+''''''
+class _at_pos:
+    _at_pos = None
+    _next_pos = None
 
 ''''''
 class _rollback:
@@ -893,7 +897,9 @@ class Read(Echo):
         read_byte = self.read_bytes(19)
         if read_byte:
             result = struct.unpack('=IBIIIH',read_byte)
-            type_code,event_length,timestamp = result[1],result[3],result[0]
+            _at_pos._at_pos = _at_pos._next_pos
+            type_code,event_length,timestamp,_at_pos._next_pos = result[1],result[3],result[0],result[4]
+
             return type_code,event_length,time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(timestamp))
         else:
             return None,None,None
@@ -1225,7 +1231,7 @@ class CheckEvent(Echo):
                 os.remove('tmp_rollback')
             _rollback._myfile = open('tmp_rollback','a+')
 
-        self._pos = start_position if start_position else 4
+        _at_pos._next_pos = start_position if start_position else  4
         if filename is None:
             print 'NO SUCH FILE '
             Usage()
@@ -1238,7 +1244,7 @@ class CheckEvent(Echo):
         if type_code is None and event_length is None and execute_time is None:
             type_code, event_length, execute_time = self.readbinlog.read_header()
         while True:
-            if type == 'pos' and self._pos > self.stop_position and self.stop_position \
+            if type == 'pos' and _at_pos._at_pos > self.stop_position and self.stop_position \
                     and type_code == binlog_events.GTID_LOG_EVENT:
                 break
             elif type == 'datetime' and self.stop_datetime and execute_time > self.stop_datetime:
@@ -1250,21 +1256,20 @@ class CheckEvent(Echo):
                     gtid = self.readbinlog.read_gtid_event(event_length)
                     if gtid == self.gtid:
                         self._gtid = gtid
-                        self.Gtid(execute_time, gtid, self._pos)
+                        self.Gtid(execute_time, gtid, _at_pos._at_pos)
                 else:
                     self.readbinlog.file_data.seek(event_length-binlog_event_header_len,1)
             else:
                 if type_code == binlog_events.GTID_LOG_EVENT:
                     break
                 self.__read_event(type_code,event_length,execute_time)
-            self._pos += event_length
             type_code, event_length, execute_time = self.readbinlog.read_header()
 
     def __thread_id_filed(self,type,type_code=None,event_length=None,execute_time=None):
         if type_code is None and event_length is None and execute_time is None:
             type_code, event_length, execute_time = self.readbinlog.read_header()
         while True:
-            if type == 'pos' and self._pos > self.stop_position and self.stop_position \
+            if type == 'pos' and _at_pos._at_pos > self.stop_position and self.stop_position \
                     and type_code == binlog_events.GTID_LOG_EVENT:
                 break
             elif type == 'datetime' and self.stop_datetime and execute_time > self.stop_datetime:
@@ -1276,9 +1281,9 @@ class CheckEvent(Echo):
                 thread_id, database_name, sql_statement = self.readbinlog.read_query_event(event_length)
                 if thread_id == self._thread_id:
                     if self._gtid:
-                        self.Gtid(execute_time, self._gtid, self._pos)
+                        self.Gtid(execute_time, self._gtid, _at_pos._at_pos)
                     self._thread_id_status = True
-                    self.TractionHeader(thread_id, database_name, sql_statement, execute_time, self._pos)
+                    self.TractionHeader(thread_id, database_name, sql_statement, execute_time, _at_pos._at_pos)
                 self.readbinlog.file_data.seek(4,1)
             elif self._thread_id_status and type_code != binlog_events.QUERY_EVENT and type_code != binlog_events.GTID_LOG_EVENT:
                 self.__read_event(type_code,event_length,execute_time)
@@ -1287,13 +1292,12 @@ class CheckEvent(Echo):
                 if thread_id != self._thread_id:
                     self._thread_id_status = None
                 else:
-                    self.TractionHeader(thread_id, database_name, sql_statement, execute_time, self._pos)
+                    self.TractionHeader(thread_id, database_name, sql_statement, execute_time, _at_pos._at_pos)
                 self.readbinlog.file_data.seek(4, 1)
             elif type_code == binlog_events.GTID_LOG_EVENT and self._thread_id_status is None:
                 self._gtid = self.readbinlog.read_gtid_event(event_length)
             else:
                 self.readbinlog.file_data.seek(event_length-binlog_event_header_len,1)
-            self._pos += event_length
             type_code, event_length, execute_time = self.readbinlog.read_header()
 
     def __read_event(self,type_code,event_length,execute_time):
@@ -1303,11 +1307,11 @@ class CheckEvent(Echo):
             self.readbinlog.file_data.seek(event_length - binlog_event_header_len - read_format_desc_event_length,1)
         elif type_code == binlog_events.QUERY_EVENT:
             thread_id, database_name, sql_statement = self.readbinlog.read_query_event(event_length)
-            self.TractionHeader(thread_id, database_name, sql_statement, execute_time, self._pos)
+            self.TractionHeader(thread_id, database_name, sql_statement, execute_time, _at_pos._at_pos)
             self.readbinlog.file_data.seek(4,1)
         elif type_code == binlog_events.XID_EVENT:
             xid_num = self.readbinlog.read_xid_variable()
-            self.Xid(execute_time, xid_num, self._pos)
+            self.Xid(execute_time, xid_num, _at_pos._at_pos)
             self.readbinlog.file_data.seek(4,1)
         elif type_code == binlog_events.TABLE_MAP_EVENT:
             database_name, table_name, self.cloums_type_id_list, self.metadata_dict = self.readbinlog.read_table_map_event(
@@ -1315,7 +1319,7 @@ class CheckEvent(Echo):
             self.Tablemap(execute_time, table_name)
         elif type_code == binlog_events.GTID_LOG_EVENT:
             gtid = self.readbinlog.read_gtid_event(event_length)
-            self.Gtid(execute_time, gtid, self._pos)
+            self.Gtid(execute_time, gtid, _at_pos._at_pos)
         elif type_code == binlog_events.WRITE_ROWS_EVENT:
             self.readbinlog.write_row_event(event_length, self.cloums_type_id_list, self.metadata_dict, type_code)
         elif type_code == binlog_events.DELETE_ROWS_EVENT:
@@ -1329,7 +1333,7 @@ class CheckEvent(Echo):
         if type_code is None and event_length is None and execute_time is None:
             type_code, event_length, execute_time = self.readbinlog.read_header()
         while True:
-            if type == 'pos' and self._pos > self.stop_position and self.stop_position and \
+            if type == 'pos' and _at_pos._at_pos > self.stop_position and self.stop_position and \
                             type_code == binlog_events.GTID_LOG_EVENT:
                 break
             elif type == 'datetime' and self.stop_datetime and execute_time > self.stop_datetime:
@@ -1337,7 +1341,6 @@ class CheckEvent(Echo):
             if type_code is None:
                 break
             self.__read_event(type_code=type_code,event_length=event_length,execute_time=execute_time)
-            self._pos += event_length
             type_code, event_length, execute_time = self.readbinlog.read_header()
 
     def __read(self):
@@ -1354,7 +1357,6 @@ class CheckEvent(Echo):
                 if  execute_time >= self.start_datetime:
                     break
                 self.readbinlog.file_data.seek(event_length - binlog_event_header_len,1)
-                self._pos += event_length
             if self.gtid:
                 self.__gtid_event_filter('datetime',type_code,event_length,execute_time)
             elif self._thread_id:
