@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 '''
-@author: xiaozhong
+@author: Great God
 '''
 
 import struct,time,datetime,os
